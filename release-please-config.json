@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "node",
+  "include-component-in-tag": false,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "changelog-sections": [
+    { "type": "feat", "section": "Fitur baru" },
+    { "type": "fix", "section": "Perbaikan bug" },
+    { "type": "perf", "section": "Performa" },
+    { "type": "refactor", "section": "Perapihan kode" },
+    { "type": "docs", "section": "Dokumentasi", "hidden": true },
+    { "type": "style", "section": "Gaya kode", "hidden": true },
+    { "type": "test", "section": "Pengujian", "hidden": true },
+    { "type": "build", "section": "Build", "hidden": true },
+    { "type": "ci", "section": "CI", "hidden": true },
+    { "type": "chore", "section": "Lain-lain", "hidden": true }
+  ],
+  "packages": {
+    ".": {}
+  }
+}

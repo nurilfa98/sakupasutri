@@ -1,0 +1,26 @@
+# Membuat/memperbarui "Release PR" otomatis dari commit Conventional Commits di
+# branch main: isinya kenaikan versi di package.json + CHANGELOG.md. Saat PR itu
+# di-merge, tag dan GitHub Release dibuat. Versi TIDAK naik di setiap push.
+#
+# Syarat sekali saja: GitHub → Settings → Actions → General →
+# "Allow GitHub Actions to create and approve pull requests" dicentang.
+# Panduan: docs/CONVENTIONS.md, bagian "Commit & rilis".
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

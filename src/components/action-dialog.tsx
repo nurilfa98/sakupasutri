@@ -1,0 +1,157 @@
+// Tombol + dialog konfirmasi untuk aksi penting (hapus, nonaktifkan, tolak,
+// batalkan, dst). Isian tambahan (misalnya alasan) diletakkan
+// di dalam dialog sebagai <form>, lalu FormData-nya dikirim ke `onConfirm`.
+//
+// Dialog tetap terbuka hanya bila ada error per isian (misal alasan terlalu pendek): error itu
+// tampil di bawah isiannya. Error umum (periode terkunci, tidak punya akses, dst.) menutup dialog
+// lalu tampil sebagai toast, sebab toast di belakang dialog tertutup layar buram dan tak terbaca.
+// Dialog tanpa isian (hanya konfirmasi) langsung ditutup saat tombol konfirmasi diklik; hasilnya
+// (berhasil / gagal) tampil sebagai toast. Bila berhasil, `successMessage` tampil sebagai toast;
+// revalidatePath() di Server Action membuat halaman menampilkan status terbaru.
+//
+// Referensi:
+// - https://ui.shadcn.com/docs/components/alert-dialog
+// - https://ui.shadcn.com/docs/components/base/toast
+
+"use client";
+
+import { LoaderCircleIcon } from "lucide-react";
+import { useState, useTransition, type ComponentProps, type FormEvent, type ReactNode } from "react";
+import { notify } from "@/lib/notify";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Textarea } from "@/components/ui/textarea";
+import type { ActionResult } from "@/types/action-result";
+
+type FieldErrorOf = (name: string) => string | undefined;
+
+export function ActionDialog({
+  label,
+  icon,
+  showLabel,
+  size,
+  className,
+  variant = "brand",
+  disabled,
+  title,
+  description,
+  confirmLabel,
+  successMessage,
+  onConfirm,
+  onSuccess,
+  children,
+}: {
+  label: string;
+  // Diisi → tombol pemicu hanya berupa ikon; `label` menjadi aria-label & tooltip.
+  // Dengan `showLabel`, ikon dan label tampil bersama.
+  icon?: ReactNode;
+  showLabel?: boolean;
+  size?: ComponentProps<typeof Button>["size"];
+  className?: string; // gaya tombol pemicu, mis. "w-full" agar dua tombol sama lebar
+  variant?: ComponentProps<typeof Button>["variant"];
+  disabled?: boolean;
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  successMessage: string;
+  onConfirm: (formData: FormData) => Promise<ActionResult>;
+  // Dipanggil setelah berhasil (dialog sudah tertutup), misal untuk pindah halaman.
+  onSuccess?: () => void;
+  children?: (fieldError: FieldErrorOf) => ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pending, startTransition] = useTransition();
+  const [error, setError] = useState<Extract<ActionResult, { success: false }> | null>(null);
+
+  const fieldError: FieldErrorOf = (name) => error?.fieldErrors?.[name]?.[0];
+  const iconOnly = !!icon && !showLabel;
+
+  function handleOpenChange(next: boolean) {
+    if (pending) return;
+    setOpen(next);
+    if (next) setError(null);
+  }
+
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const closeNow = !children; // tanpa isian: tidak ada yang perlu diperbaiki di dalam dialog
+    startTransition(async () => {
+      if (closeNow) setOpen(false);
+      const result = await onConfirm(formData);
+      if (result.success) {
+        setOpen(false);
+        notify.success(successMessage);
+        onSuccess?.();
+      } else {
+        setError(result);
+        if (!result.fieldErrors) {
+          setOpen(false);
+          notify.error(result.message);
+        }
+      }
+    });
+  }
+
+  return (
+    <>
+      <Button
+        variant={variant}
+        size={size ?? (iconOnly ? "icon" : "default")}
+        className={className}
+        aria-label={iconOnly ? label : undefined}
+        title={iconOnly ? label : undefined}
+        disabled={disabled || pending}
+        onClick={() => handleOpenChange(true)}
+      >
+        {iconOnly ? (
+          icon
+        ) : (
+          <>
+            {icon}
+            {label}
+          </>
+        )}
+      </Button>
+      <AlertDialog open={open} onOpenChange={handleOpenChange}>
+        {/* HP: hampir selebar layar (margin 8px) dan bisa digulir bila isiannya panjang. */}
+        <AlertDialogContent className="max-h-[calc(100dvh-1rem)] overflow-y-auto data-[size=default]:max-w-[calc(100%-1rem)] data-[size=default]:sm:max-w-md">
+          <form onSubmit={handleSubmit} className="contents">
+            <AlertDialogHeader>
+              <AlertDialogTitle>{title}</AlertDialogTitle>
+              <AlertDialogDescription>{description}</AlertDialogDescription>
+            </AlertDialogHeader>
+            {children && <FieldGroup>{children(fieldError)}</FieldGroup>}
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={pending}>Batal</AlertDialogCancel>
+              <Button type="submit" variant={variant === "destructive" ? "destructive" : "brand"} disabled={pending}>
+                {pending && <LoaderCircleIcon className="animate-spin" />}
+                {confirmLabel}
+              </Button>
+            </AlertDialogFooter>
+          </form>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+// Isian alasan (wajib) untuk tolak, batalkan, dan laporkan tidak sesuai.
+export function ReasonField({ label, placeholder, error }: { label: string; placeholder: string; error?: string }) {
+  return (
+    <Field data-invalid={!!error}>
+      <FieldLabel htmlFor="reason">{label}</FieldLabel>
+      <Textarea id="reason" name="reason" placeholder={placeholder} maxLength={500} aria-invalid={!!error} required />
+      <FieldError>{error}</FieldError>
+    </Field>
+  );
+}

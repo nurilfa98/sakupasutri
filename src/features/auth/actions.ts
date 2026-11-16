@@ -1,0 +1,277 @@
+// Server Action untuk login & logout.
+//
+// "use server" membuat setiap fungsi di file ini bisa dipanggil dari browser
+// (Next.js membuatkan endpoint POST di belakang layar). Artinya fungsi ini
+// adalah PINTU PUBLIK: siapa pun bisa memanggilnya dengan data apa pun.
+// Karena itu urutannya selalu: validasi → cek → baru ubah data.
+//
+// Referensi:
+// - node_modules/next/dist/docs/01-app/01-getting-started/07-mutating-data.md
+// - node_modules/next/dist/docs/01-app/02-guides/forms.md (bagian useActionState)
+// - node_modules/next/dist/docs/01-app/02-guides/authentication.md
+//   (bagian "Sign-up and login functionality" & "Deleting the session")
+
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { eq } from "drizzle-orm";
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
+import { after } from "next/server";
+import { z } from "zod";
+import { logAudit } from "@/lib/audit";
+import { hashPassword, verifyPassword } from "@/lib/auth/password";
+import { createSession, destroySession, ensureDeviceId, getSession, sessionExpiry } from "@/lib/auth/session";
+import { db } from "@/lib/db";
+import { users } from "@/lib/db/schema";
+import { sendEmail } from "@/lib/email";
+import { getClientIp } from "@/lib/request";
+import type { ActionResult } from "@/types/action-result";
+import { describeDevice, describeLocation } from "./device-info";
+import { newDeviceEmail } from "./emails";
+import { findUserCredentials, findUserForLogin } from "./queries";
+import { checkLoginRateLimit, recordLoginAttempt } from "./rate-limit";
+import { changePasswordSchema, loginSchema } from "./schemas";
+import { extendSession, isSessionActive, openSession, revokeOtherSessionsOf, revokeSessionOf } from "./sessions";
+
+// Dipakai bersama useActionState di login-form.tsx. Karena itu parameter
+// pertamanya adalah state sebelumnya, baru formData.
+// retryAfterSeconds hanya ada saat kena rate limit: form mengunci tombol
+// Masuk dan menampilkan hitungan mundur selama itu.
+type LoginResult = ActionResult & { retryAfterSeconds?: number };
+
+export async function login(_prevState: LoginResult | undefined, formData: FormData): Promise<LoginResult> {
+  // 1. Validasi input
+  const parsed = loginSchema.safeParse({
+    email: formData.get("email"),
+    password: formData.get("password"),
+  });
+
+  if (!parsed.success) {
+    return {
+      success: false,
+      message: "Periksa kembali isian Anda.",
+      fieldErrors: z.flattenError(parsed.error).fieldErrors,
+    };
+  }
+
+  const { email, password } = parsed.data;
+  const ip = await getClientIp();
+
+  // 2. Rate limit. Dicek SEBELUM bcrypt: selain menghambat penebakan,
+  // juga menghemat CPU karena bcrypt sengaja dibuat lambat.
+  const rateLimit = await checkLoginRateLimit(email, ip);
+  if (rateLimit.limited) {
+    return {
+      success: false,
+      message: `Terlalu banyak percobaan login. Coba lagi dalam ${rateLimit.retryAfterMinutes} menit.`,
+      retryAfterSeconds: rateLimit.retryAfterSeconds,
+    };
+  }
+
+  // 3. Cari user & cocokkan password.
+  // Pesan error sengaja dibuat sama untuk "email tidak ada" dan "password
+  // salah", supaya penyerang tidak bisa mengetahui email mana yang terdaftar.
+  const user = await findUserForLogin(email);
+  const passwordValid = await verifyPassword(password, user?.passwordHash);
+
+  if (!user || !passwordValid) {
+    await recordLoginAttempt(email, ip, false);
+    // Audit hanya untuk akun yang ada, agar admin bisa melihat bila ada
+    // yang mencoba menebak password akun tertentu.
+    if (user) await logFailedLogin(user, "WRONG_PASSWORD", ip);
+    return { success: false, message: "Email atau password salah." };
+  }
+
+  // Aman memberi tahu status akun di sini karena password sudah terbukti benar.
+  if (!user.isActive) {
+    await logFailedLogin(user, "INACTIVE", ip);
+    return { success: false, message: "Akun Anda dinonaktifkan. Hubungi admin." };
+  }
+
+  // 4. Catat, lalu buat session (menulis cookie terenkripsi)
+  await recordLoginAttempt(email, ip, true);
+  // Checkbox "Ingat saya" di login-form.tsx: value="1" bila dicentang.
+  const rememberMe = formData.get("rememberMe") === "1";
+  const device = await readDevice();
+  const expiresAt = sessionExpiry(rememberMe);
+  // Setiap login = satu baris "perangkat yang sedang login" (menu Profil).
+  const { sessionId, isNewDevice } = await openSession({
+    userId: user.id,
+    deviceId: device.id,
+    deviceLabel: device.label,
+    ipAddress: ip,
+    location: device.location,
+    expiresAt,
+  });
+  await logAudit({
+    userId: user.id,
+    action: "LOGIN_SUCCESS",
+    entityName: "users",
+    entityId: user.id,
+    newValues: { device: device.label, location: device.location },
+    ipAddress: ip,
+  });
+  await createSession(user.id, user.sessionVersion, rememberMe, sessionId, expiresAt);
+  // Login dari perangkat yang belum dikenal → email peringatan ke email
+  // terdaftar (tidak menunda login).
+  if (isNewDevice) {
+    after(() =>
+      sendEmail(
+        newDeviceEmail({
+          to: user.email,
+          fullName: user.fullName,
+          device: device.label,
+          location: device.location,
+          ip,
+          when: new Date(),
+        }),
+      ),
+    );
+  }
+  clearClientCache();
+
+  // 5. Pindah halaman. redirect() bekerja dengan melempar error khusus, jadi
+  // JANGAN letakkan di dalam try/catch, nanti tertangkap dan tidak jalan.
+  // User dengan password sementara langsung diarahkan ke halaman ganti password.
+  redirect(user.mustChangePassword ? "/change-password" : "/");
+}
+
+// Ganti password milik sendiri. Dipakai untuk dua keadaan:
+// - wajib: password masih sementara (user baru / di-reset admin)
+// - sukarela: dari menu user → "Ganti password"
+export async function changePassword(_prevState: ActionResult | undefined, formData: FormData): Promise<ActionResult> {
+  // 1. Pastikan session masih berlaku (lihat alasan findUserCredentials).
+  const session = await getSession();
+  const account = session.userId ? await findUserCredentials(session.userId) : undefined;
+  if (
+    !account ||
+    !account.isActive ||
+    account.sessionVersion !== session.sessionVersion ||
+    !session.sessionId ||
+    !(await isSessionActive(account.id, session.sessionId))
+  ) {
+    redirect("/login");
+  }
+  const currentSessionId = session.sessionId;
+
+  // 2. Validasi input
+  const parsed = changePasswordSchema.safeParse({
+    currentPassword: formData.get("currentPassword"),
+    newPassword: formData.get("newPassword"),
+    confirmPassword: formData.get("confirmPassword"),
+  });
+  if (!parsed.success) {
+    return {
+      success: false,
+      message: "Periksa kembali isian Anda.",
+      fieldErrors: z.flattenError(parsed.error).fieldErrors,
+    };
+  }
+
+  // 3. Password lama wajib benar. Tanpa ini, orang yang menemukan laptop
+  // dalam keadaan login bisa mengambil alih akun dengan mengganti password.
+  const { currentPassword, newPassword } = parsed.data;
+  if (!(await verifyPassword(currentPassword, account.passwordHash))) {
+    return {
+      success: false,
+      message: "Periksa kembali isian Anda.",
+      fieldErrors: { currentPassword: ["Password saat ini salah"] },
+    };
+  }
+
+  // 4. Simpan. sessionVersion dinaikkan → session di perangkat lain berakhir
+  // (barisnya di daftar perangkat ikut dicabut, kecuali perangkat ini).
+  const sessionVersion = account.sessionVersion + 1;
+  const passwordHash = await hashPassword(newPassword);
+  const expiresAt = sessionExpiry(session.rememberMe);
+  await db.transaction(async (tx) => {
+    await tx
+      .update(users)
+      .set({ passwordHash, mustChangePassword: false, sessionVersion, updatedBy: account.id })
+      .where(eq(users.id, account.id));
+    await revokeOtherSessionsOf(account.id, currentSessionId, "PASSWORD", tx);
+    await extendSession(currentSessionId, expiresAt, tx);
+    await logAudit(
+      {
+        userId: account.id,
+        action: "PASSWORD_CHANGED",
+        entityName: "users",
+        entityId: account.id,
+        newValues: { wasTemporary: account.mustChangePassword },
+        ipAddress: await getClientIp(),
+      },
+      tx,
+    );
+  });
+
+  // 5. Perangkat ini tetap login dengan session versi baru.
+  // Pilihan "Ingat saya" dari sesi sebelumnya dipertahankan.
+  await createSession(account.id, sessionVersion, session.rememberMe, currentSessionId, expiresAt);
+  clearClientCache();
+  redirect("/");
+}
+
+// Logout memanggil redirect("/login") di akhir. Tanpa redirect, Next.js
+// merender ulang halaman yang sedang terbuka (misal /change-password) setelah
+// session dihapus; halaman itu lalu redirect ke /login dari dalam render
+// Server Action, dan respons yang dihasilkan tidak valid bagi klien
+// ("An unexpected response was received from the server."). Dengan redirect()
+// di action, klien langsung menerima instruksi pindah halaman yang benar.
+// Hook use-logout.ts tetap memuat ulang halaman penuh setelahnya, sehingga
+// tidak ada sisa data user di memori browser (cacheComponents menyimpan
+// halaman sebelumnya secara tersembunyi lewat React <Activity>).
+export async function logout() {
+  // Ambil userId SEBELUM session dihapus, untuk dicatat di audit log.
+  const { userId, sessionId } = await getSession();
+  const account = userId ? await findUserCredentials(userId) : undefined;
+  // Perangkat ini keluar dari daftar "perangkat yang sedang login".
+  if (userId && sessionId) await revokeSessionOf(userId, sessionId, "LOGOUT");
+
+  if (account) {
+    await logAudit({
+      userId: account.id,
+      action: "LOGOUT",
+      entityName: "users",
+      entityId: account.id,
+      ipAddress: await getClientIp(),
+    });
+  }
+
+  await destroySession();
+  redirect("/login");
+}
+
+// ID perangkat (cookie), label perangkat dari User-Agent, dan perkiraan kota
+// dari header Vercel (kosong di localhost).
+async function readDevice() {
+  const requestHeaders = await headers();
+  return {
+    id: await ensureDeviceId(),
+    label: describeDevice(requestHeaders.get("user-agent")),
+    location: describeLocation(requestHeaders.get("x-vercel-ip-city"), requestHeaders.get("x-vercel-ip-country")),
+  };
+}
+
+// Halaman yang sudah di-prefetch untuk user (lihat 'use cache: private' di
+// lib/auth/dal.ts) tersimpan di memori browser. Saat login, cache itu dibuang
+// agar halaman milik user sebelumnya tidak ikut tampil, misalnya saat session
+// user lain kedaluwarsa lalu orang berbeda login di tab yang sama.
+// Referensi: node_modules/next/dist/docs/01-app/03-api-reference/04-functions/revalidatePath.md
+// (bagian "Revalidating all data")
+function clearClientCache() {
+  revalidatePath("/", "layout");
+}
+
+// Fungsi tanpa `export` di file "use server" TIDAK menjadi Server Action,
+// jadi tidak bisa dipanggil dari browser. Aman untuk helper internal.
+function logFailedLogin(account: { id: string }, reason: "WRONG_PASSWORD" | "INACTIVE", ip: string | null) {
+  return logAudit({
+    userId: null, // pelaku belum terautentikasi
+    action: "LOGIN_FAILED",
+    entityName: "users",
+    entityId: account.id, // akun yang dicoba
+    newValues: { reason },
+    ipAddress: ip,
+  });
+}

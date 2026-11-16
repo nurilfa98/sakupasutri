@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Logo placeholder netral: empat kotak membulat (kesan "kotak menu").
+       GANTI dengan logo proyek Anda. Versi React-nya ada di src/components/layout/logo-mark.tsx; ubah keduanya bersamaan.
+       Setelah diubah, buat ulang ikon PNG: pnpm icons:generate
+       Script itu mencari radius sudut 112 dan grup ber-id "mark", jadi keduanya jangan diubah. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#3730a3"/>
+    </linearGradient>
+    <radialGradient id="shine" cx=".25" cy=".15" r=".8">
+      <stop offset="0" stop-color="#fff" stop-opacity=".22"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="url(#shine)"/>
+  <g id="mark">
+    <rect x="140" y="140" width="112" height="112" rx="32" fill="#fff"/>
+    <rect x="260" y="140" width="112" height="112" rx="32" fill="#fff" fill-opacity=".55"/>
+    <rect x="140" y="260" width="112" height="112" rx="32" fill="#fff" fill-opacity=".55"/>
+    <rect x="260" y="260" width="112" height="112" rx="32" fill="#fff"/>
+  </g>
+</svg>
